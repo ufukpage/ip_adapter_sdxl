@@ -1,4 +1,6 @@
 # Configuration for Cog
+image: "r8.im/ufukpage/2-ip-adapter"
+
 build:
   gpu: true
   python_version: "3.11"
@@ -16,6 +18,8 @@ build:
     - "einops"
     - "insightface"
     - "onnxruntime-gpu"
+    - "fastapi>=0.100.0"  # Add this line
+
 
   run:
     - mkdir -p outputs

@@ -16,7 +16,7 @@ def main():
     outputs = predictor.predict(
         image1=image1_url,
         image2=image2_url,
-        prompt1="2 people having dinner in the cafe in the Paris. Bodies and faces towards the camera.", 
+        prompt="2 people having dinner in the cafe in the Paris. Bodies and faces towards the camera.",
         prompt2="",
         #negative_prompt="lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry",
         negative_prompt="bad hands, bad anatomy, ugly, deformed, (face asymmetry, eyes asymmetry, deformed eyes, deformed mouth, open mouth)",
@@ -27,7 +27,7 @@ def main():
         output_width=512,
         output_height=512,
         use_refiner=False,
-        use_face_detailer=True,
+        use_face_detailer=False,
         face_refinement_strength=0.4
     )
     

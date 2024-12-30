@@ -147,17 +147,13 @@ class TwoPersonPredictor(BasePredictor):
         self,
         image1: Path = Input(description="Input face image for first person"),
         image2: Path = Input(description="Input face image for second person"),
-        prompt1: str = Input(
-            description="Prompt for first person (left side)",
-            default=""
-        ),
-        prompt2: str = Input(
-            description="Prompt for second person (right side)",
+        prompt: str = Input(
+            description="Prompt for generation. Ex: 2 people having dinner in the cafe in the Paris. Bodies and faces towards the camera.",
             default=""
         ),
         negative_prompt: str = Input(
             description="Negative Prompt (applies to both)",
-            default="monochrome, lowres, bad anatomy, worst quality, low quality"
+            default="bad hands, bad anatomy, ugly, deformed, (face asymmetry, eyes asymmetry, deformed eyes, deformed mouth, open mouth)"
         ),
         scale: float = Input(
             description="Scale (influence of input images)",
@@ -173,7 +169,7 @@ class TwoPersonPredictor(BasePredictor):
         ),
         use_face_detailer: bool = Input(
             description="Use face detailer for better face quality",
-            default=True
+            default=False
         ),
         num_outputs: int = Input(
             description="Number of images to output",
@@ -185,7 +181,7 @@ class TwoPersonPredictor(BasePredictor):
             description="Number of denoising steps",
             ge=1,
             le=500,
-            default=20
+            default=40
         ),
         seed: int = Input(
             description="Random seed. Leave blank to randomize",
@@ -201,7 +197,7 @@ class TwoPersonPredictor(BasePredictor):
         ),
         use_refiner: bool = Input(
             description="Use refiner for higher quality (slower)",
-            default=True
+            default=False
         )
     ) -> List[Path]:
         """Generate an image with two different persons"""
