@@ -10,6 +10,7 @@ import cv2
 import numpy as np
 from insightface.app import FaceAnalysis
 import torch.nn.functional as F
+from PIL import Image
 
 class TwoPersonPredictor(BasePredictor):
     def setup(self, weights= None) -> None:
@@ -117,7 +118,7 @@ class TwoPersonPredictor(BasePredictor):
         return face_image1 if sim1 > sim2 else face_image2
 
     def refine_faces(self, image, prompt, face_image1, face_image2, strength=0.4):
-        """Refined face detection and matching"""
+        """Refined face detection and matching with high-res generation"""
         boxes, faces = self.detect_faces(image)
         refined_image = image.copy()
         
@@ -125,18 +126,41 @@ class TwoPersonPredictor(BasePredictor):
             x1, y1, x2, y2 = box
             face_crop = image.crop((x1, y1, x2, y2))
             
+            # Calculate dimensions
+            face_width = x2 - x1
+            face_height = y2 - y1
+            
+            # Calculate adaptive scale factor to reach 512 in the larger dimension
+            target_size = 512
+            width_scale = target_size / face_width
+            height_scale = target_size / face_height
+            scale_factor = min(width_scale, height_scale)
+            
+            # Calculate new dimensions while maintaining aspect ratio
+            high_res_size = (
+                int(face_width * scale_factor),
+                int(face_height * scale_factor)
+            )
+            face_crop = face_crop.resize(high_res_size)
+            
             # Find the closest matching input face
             reference_face = self.find_closest_face(face_crop, face_image1, face_image2)
             
-            # Refine the face using img2img with IP-Adapter
+            # Generate high-res refined face
             refined_face = self.pipeline(
                 prompt=prompt,
                 image=face_crop,
-                ip_adapter_image=reference_face,  # Use IP-Adapter for conditioning
+                ip_adapter_image=reference_face,
                 num_inference_steps=20,
                 strength=strength,
                 guidance_scale=7.5,
             ).images[0]
+            
+            # Resize back to original dimensions with high-quality downsampling
+            refined_face = refined_face.resize(
+                (face_width, face_height), 
+                resample=Image.LANCZOS
+            )
             
             # Paste the refined face back
             refined_image.paste(refined_face, (x1, y1))
@@ -226,8 +250,6 @@ class TwoPersonPredictor(BasePredictor):
 
         generator = torch.Generator(device="cuda").manual_seed(seed)
 
-        # Combine prompts
-        prompt = f"{prompt1} {prompt2}"
 
         # Generate images
         output_paths = []
