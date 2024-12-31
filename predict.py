@@ -3,6 +3,7 @@ from cog import BasePredictor, Input, Path
 import os
 import torch
 from typing import List
+import gc
 from diffusers.utils import load_image
 from diffusers.image_processor import IPAdapterMaskProcessor
 from diffusers import DiffusionPipeline
@@ -13,56 +14,48 @@ import torch.nn.functional as F
 from PIL import Image
 
 class TwoPersonPredictor(BasePredictor):
-    def setup(self, weights= None) -> None:
-        """Load the model into memory"""
-        # Initialize base pipeline with explicit configuration
+    def setup(self):
+        """Setup is run when the container starts"""
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        # Pre-create directories
+        os.makedirs('models/insightface', exist_ok=True)
+        os.makedirs('outputs', exist_ok=True)
+        
+        # Define model cache directory
+        cache_dir = "./model-cache"
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        # Load pipeline with optimized settings and caching
         self.pipeline = DiffusionPipeline.from_pretrained(
-            #"stabilityai/stable-diffusion-xl-base-1.0",
             "SG161222/RealVisXL_V5.0",
             torch_dtype=torch.float16,
             variant="fp16",
             use_safetensors=True,
-        ).to("cuda")
-
-        # Set the scheduler to DPM++ SDE Karras
-        self.pipeline.scheduler = self.pipeline.scheduler.from_config(
-            self.pipeline.scheduler.config,
-            algorithm_type="dpmsolver++",
-            solver_type="midpoint",
-            use_karras_sigmas=True
+            device_map="auto",
+            low_cpu_mem_usage=True,
+            cache_dir=cache_dir  # Add cache directory
         )
-
-        # Initialize refiner pipeline with explicit configuration
-        self.refiner = DiffusionPipeline.from_pretrained(
-            "stabilityai/stable-diffusion-xl-refiner-1.0",
-            torch_dtype=torch.float16,
-            variant="fp16",
-            use_safetensors=True,
-            vae=self.pipeline.vae,
-            text_encoder_2=self.pipeline.text_encoder_2,
-        ).to("cuda")
-
-        # Load IP-Adapter with specific configuration
+        
+        # Load IP adapter with caching
         self.pipeline.load_ip_adapter(
             "h94/IP-Adapter",
             subfolder="sdxl_models",
             weight_name="ip-adapter-plus-face_sdxl_vit-h.safetensors",
-            image_encoder_folder="models/image_encoder"
+            device_map="auto",
+            cache_dir=cache_dir  # Add cache directory
         )
         
-        # Set InsightFace model directory
-        model_dir = os.path.expanduser('models/insightface')
-        os.makedirs(model_dir, exist_ok=True)
-        
-        # Initialize InsightFace with specific model directory
+        # Initialize face analyzer with local model path
         self.face_analyzer = FaceAnalysis(
             name="buffalo_l",
-            root=model_dir,  # Specify model directory
             providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
         )
-        
-        # Download and prepare the face analysis model
         self.face_analyzer.prepare(ctx_id=0, det_size=(640, 640))
+        
+        # Optional: compile unet for faster inference if using PyTorch 2.0+
+        if hasattr(torch, 'compile'):
+            self.pipeline.unet = torch.compile(self.pipeline.unet)
 
     def detect_faces(self, image):
         """Face detection using InsightFace"""
@@ -169,12 +162,9 @@ class TwoPersonPredictor(BasePredictor):
 
     def predict(
         self,
-        image1: Path = Input(description="Input face image for first person"),
-        image2: Path = Input(description="Input face image for second person"),
-        prompt: str = Input(
-            description="Prompt for generation. Ex: 2 people having dinner in the cafe in the Paris. Bodies and faces towards the camera.",
-            default=""
-        ),
+        image1: Path = Input(description="First person image"),
+        image2: Path = Input(description="Second person image"),
+        prompt: str = Input(description="Prompt"),
         negative_prompt: str = Input(
             description="Negative Prompt (applies to both)",
             default="bad hands, bad anatomy, ugly, deformed, (face asymmetry, eyes asymmetry, deformed eyes, deformed mouth, open mouth)"
@@ -229,112 +219,119 @@ class TwoPersonPredictor(BasePredictor):
             seed = int.from_bytes(os.urandom(2), "big")
         print(f"Using seed: {seed}")
 
-
-        # Load and process face images using load_image instead of Image.open
-        face_image1 = load_image(str(image1)).convert("RGB")
-        face_image2 = load_image(str(image2)).convert("RGB")
-
-        # Load the predefined masks from huggingface
-        mask1 = load_image("https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/ip_mask_mask1.png").convert('L')
-        mask2 = load_image("https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/ip_mask_mask2.png").convert('L')
-        mask1 = mask1.resize((output_width, output_height))
-        mask2 = mask2.resize((output_width, output_height))
-
-        # Process masks to get correct shape [1, num_images_for_ip_adapter, height, width]
-        processor = IPAdapterMaskProcessor()
-        masks = processor.preprocess([mask1, mask2], height=output_height, width=output_width)
-        masks = [masks.reshape(1, 2, output_height, output_width)]
-
-        # Set IP adapter scale
-        self.pipeline.set_ip_adapter_scale(scale)
-
-        generator = torch.Generator(device="cuda").manual_seed(seed)
-
-
-        # Generate images
-        output_paths = []
-        for _ in range(num_outputs):
-            # Clear VRAM before main generation
-            torch.cuda.empty_cache()
+        try:
+            # Load models only when needed
+            self.load_models()
             
-            # Move models to CPU temporarily if needed
-            if use_refiner:
-                self.refiner.to("cpu")
-            
-            # Main generation
-            images = self.pipeline(
-                prompt=prompt,
-                ip_adapter_image=[[face_image1, face_image2]],
-                negative_prompt=negative_prompt,
-                num_inference_steps=num_inference_steps,
-                generator=generator,
-                cross_attention_kwargs={"ip_adapter_masks": masks},
-                output_type="latent" if use_refiner else "pil",
-                height=output_height,
-                width=output_width,
-            ).images
-            
-            if use_refiner:
-                # Clear VRAM after main generation
+            # Load and process face images using load_image instead of Image.open
+            face_image1 = load_image(str(image1)).convert("RGB")
+            face_image2 = load_image(str(image2)).convert("RGB")
+
+            # Load the predefined masks from huggingface
+            mask1 = load_image("https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/ip_mask_mask1.png").convert('L')
+            mask2 = load_image("https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/ip_mask_mask2.png").convert('L')
+            mask1 = mask1.resize((output_width, output_height))
+            mask2 = mask2.resize((output_width, output_height))
+
+            # Process masks to get correct shape [1, num_images_for_ip_adapter, height, width]
+            processor = IPAdapterMaskProcessor()
+            masks = processor.preprocess([mask1, mask2], height=output_height, width=output_width)
+            masks = [masks.reshape(1, 2, output_height, output_width)]
+
+            # Set IP adapter scale
+            self.pipeline.set_ip_adapter_scale(scale)
+
+            generator = torch.Generator(device="cuda").manual_seed(seed)
+
+            # Generate images
+            output_paths = []
+            for _ in range(num_outputs):
+                # Clear VRAM before main generation
                 torch.cuda.empty_cache()
                 
-                # Move pipeline to CPU and refiner to GPU
-                self.pipeline.to("cpu")
-                self.refiner.to("cuda")
+                # Move models to CPU temporarily if needed
+                if use_refiner:
+                    self.refiner.to("cpu")
                 
-                # Refinement step
-                images = self.refiner(
+                # Main generation
+                images = self.pipeline(
                     prompt=prompt,
+                    ip_adapter_image=[[face_image1, face_image2]],
                     negative_prompt=negative_prompt,
-                    image=images,
-                    num_inference_steps=20,
+                    num_inference_steps=num_inference_steps,
                     generator=generator,
+                    cross_attention_kwargs={"ip_adapter_masks": masks},
+                    output_type="latent" if use_refiner else "pil",
                     height=output_height,
                     width=output_width,
                 ).images
                 
-                # Move refiner back to CPU and pipeline back to GPU for face refinement
-                self.refiner.to("cpu")
-                self.pipeline.to("cuda")
-                
-            # Clear VRAM before face refinement
-            torch.cuda.empty_cache()
-            
-            # Apply face refinement only if enabled
-            if use_face_detailer:
+                if use_refiner:
+                    # Clear VRAM after main generation
+                    torch.cuda.empty_cache()
+                    
+                    # Move pipeline to CPU and refiner to GPU
+                    self.pipeline.to("cpu")
+                    self.refiner.to("cuda")
+                    
+                    # Refinement step
+                    images = self.refiner(
+                        prompt=prompt,
+                        negative_prompt=negative_prompt,
+                        image=images,
+                        num_inference_steps=20,
+                        generator=generator,
+                        height=output_height,
+                        width=output_width,
+                    ).images
+                    
+                    # Move refiner back to CPU and pipeline back to GPU for face refinement
+                    self.refiner.to("cpu")
+                    self.pipeline.to("cuda")
+                    
                 # Clear VRAM before face refinement
                 torch.cuda.empty_cache()
                 
-                # Store original scale and set new scale for face refinement
-                original_scale = scale  # Use the input scale parameter
-                self.pipeline.set_ip_adapter_scale(0.7)  # Adjust this value as needed
-                
-                refined_images = []
-                for image in images:
-                    # Clear VRAM before each face refinement iteration
+                # Apply face refinement only if enabled
+                if use_face_detailer:
+                    # Clear VRAM before face refinement
                     torch.cuda.empty_cache()
                     
-                    refined_image = self.refine_faces(
-                        image=image, 
-                        prompt=prompt, 
-                        face_image1=face_image1, 
-                        face_image2=face_image2,
-                        strength=face_refinement_strength
-                    )
-                    refined_images.append(refined_image)
+                    # Store original scale and set new scale for face refinement
+                    original_scale = scale  # Use the input scale parameter
+                    self.pipeline.set_ip_adapter_scale(0.7)  # Adjust this value as needed
                     
-                    # Optional: force garbage collection after each iteration
-                    torch.cuda.empty_cache()
-                
-                images = refined_images
-                
-                # Restore original IP-Adapter scale
-                self.pipeline.set_ip_adapter_scale(original_scale)
+                    refined_images = []
+                    for image in images:
+                        # Clear VRAM before each face refinement iteration
+                        torch.cuda.empty_cache()
+                        
+                        refined_image = self.refine_faces(
+                            image=image, 
+                            prompt=prompt, 
+                            face_image1=face_image1, 
+                            face_image2=face_image2,
+                            strength=face_refinement_strength
+                        )
+                        refined_images.append(refined_image)
+                        
+                        # Optional: force garbage collection after each iteration
+                        torch.cuda.empty_cache()
+                    
+                    images = refined_images
+                    
+                    # Restore original IP-Adapter scale
+                    self.pipeline.set_ip_adapter_scale(original_scale)
 
-            # Save each refined image
-            for i, image in enumerate(images):
-                output_path = f"./outputs/output-{i}.png"
-                image.save(output_path)
-                output_paths.append(Path(output_path))
+                # Save each refined image
+                for i, image in enumerate(images):
+                    output_path = f"./outputs/output-{i}.png"
+                    image.save(output_path)
+                    output_paths.append(Path(output_path))
 
-        return output_paths 
+            return output_paths 
+
+        finally:
+            # Clean up memory
+            torch.cuda.empty_cache()
+            gc.collect() 

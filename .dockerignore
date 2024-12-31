@@ -35,8 +35,6 @@ venv/
 
 # Project specific
 outputs/
-model-cache/
-.cog/
 
 # Logs and databases
 *.log
