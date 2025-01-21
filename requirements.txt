@@ -1,0 +1,8 @@
+diffusers
+transformers
+accelerate
+einops
+insightface
+onnxruntime-gpu
+fastapi>=0.100.0
+runpod>=0.9.0 
