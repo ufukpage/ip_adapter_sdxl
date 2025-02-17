@@ -35,9 +35,9 @@ class TwoPersonPredictor(BasePredictor):
             torch_dtype=torch.float16,
             variant="fp16",
             use_safetensors=True,
-            device_map="auto",
+            device_map="balanced",
             low_cpu_mem_usage=True,
-            cache_dir=cache_dir  # Add cache directory
+            cache_dir=cache_dir
         )
         
         # Load IP adapter with caching
@@ -45,8 +45,8 @@ class TwoPersonPredictor(BasePredictor):
             "h94/IP-Adapter",
             subfolder="sdxl_models",
             weight_name="ip-adapter-plus-face_sdxl_vit-h.safetensors",
-            device_map="auto",
-            cache_dir=cache_dir  # Add cache directory
+            device_map="balanced",
+            cache_dir=cache_dir
         )
         
         # Initialize face analyzer with local model path
@@ -55,6 +55,10 @@ class TwoPersonPredictor(BasePredictor):
             providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
         )
         self.face_analyzer.prepare(ctx_id=0, det_size=(640, 640))
+        
+        # Move pipeline to GPU if available
+        if self.device == "cuda":
+            self.pipeline.to(self.device)
         
         # Optional: compile unet for faster inference if using PyTorch 2.0+
         if hasattr(torch, 'compile'):
@@ -345,78 +349,81 @@ class TwoPersonPredictor(BasePredictor):
             torch.cuda.empty_cache()
             gc.collect()
 
-    @runpod.handler
-    def handler(self, event):
-        """Handle RunPod event"""
-        try:
-            # Extract inputs from event
-            input_data = event["input"]
-            
-            # Decode base64 images
-            image1_data = base64.b64decode(input_data["image1"])
-            image2_data = base64.b64decode(input_data["image2"])
-            
-            # Save temporary files
-            temp_image1 = "temp_image1.png"
-            temp_image2 = "temp_image2.png"
-            
-            with open(temp_image1, "wb") as f:
-                f.write(image1_data)
-            with open(temp_image2, "wb") as f:
-                f.write(image2_data)
+def handler(event):
+    """Handle RunPod event"""
+    try:
+        # Extract inputs from event
+        input_data = event["input"]
+        
+        # Initialize predictor if not already done
+        predictor = TwoPersonPredictor()
+        predictor.setup()
+        
+        # Decode base64 images
+        image1_data = base64.b64decode(input_data["image1"])
+        image2_data = base64.b64decode(input_data["image2"])
+        
+        # Save temporary files
+        temp_image1 = "temp_image1.png"
+        temp_image2 = "temp_image2.png"
+        
+        with open(temp_image1, "wb") as f:
+            f.write(image1_data)
+        with open(temp_image2, "wb") as f:
+            f.write(image2_data)
 
-            # Get other parameters
-            prompt = input_data.get("prompt", "")
-            negative_prompt = input_data.get("negative_prompt", "bad hands, bad anatomy, ugly, deformed...")
-            scale = input_data.get("scale", 0.7)
-            face_refinement_strength = input_data.get("face_refinement_strength", 0.4)
-            use_face_detailer = input_data.get("use_face_detailer", False)
-            num_outputs = input_data.get("num_outputs", 1)
-            num_inference_steps = input_data.get("num_inference_steps", 40)
-            seed = input_data.get("seed", None)
-            output_width = input_data.get("output_width", 768)
-            output_height = input_data.get("output_height", 1024)
-            use_refiner = input_data.get("use_refiner", False)
+        # Get other parameters
+        prompt = input_data.get("prompt", "")
+        negative_prompt = input_data.get("negative_prompt", "bad hands, bad anatomy, ugly, deformed...")
+        scale = input_data.get("scale", 0.7)
+        face_refinement_strength = input_data.get("face_refinement_strength", 0.4)
+        use_face_detailer = input_data.get("use_face_detailer", False)
+        num_outputs = input_data.get("num_outputs", 1)
+        num_inference_steps = input_data.get("num_inference_steps", 40)
+        seed = input_data.get("seed", None)
+        output_width = input_data.get("output_width", 768)
+        output_height = input_data.get("output_height", 1024)
+        use_refiner = input_data.get("use_refiner", False)
 
-            # Run prediction
-            output_paths = self.predict(
-                image1=Path(temp_image1),
-                image2=Path(temp_image2),
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                scale=scale,
-                face_refinement_strength=face_refinement_strength,
-                use_face_detailer=use_face_detailer,
-                num_outputs=num_outputs,
-                num_inference_steps=num_inference_steps,
-                seed=seed,
-                output_width=output_width,
-                output_height=output_height,
-                use_refiner=use_refiner
-            )
+        # Run prediction
+        output_paths = predictor.predict(
+            image1=Path(temp_image1),
+            image2=Path(temp_image2),
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            scale=scale,
+            face_refinement_strength=face_refinement_strength,
+            use_face_detailer=use_face_detailer,
+            num_outputs=num_outputs,
+            num_inference_steps=num_inference_steps,
+            seed=seed,
+            output_width=output_width,
+            output_height=output_height,
+            use_refiner=use_refiner
+        )
 
-            # Convert output images to base64
-            output_images = []
-            for path in output_paths:
-                with Image.open(path) as img:
-                    output_images.append(self.encode_image_to_base64(img))
+        # Convert output images to base64
+        output_images = []
+        for path in output_paths:
+            with Image.open(path) as img:
+                output_images.append(predictor.encode_image_to_base64(img))
 
-            # Clean up temporary files
-            os.remove(temp_image1)
-            os.remove(temp_image2)
-            for path in output_paths:
-                os.remove(path)
+        # Clean up temporary files
+        os.remove(temp_image1)
+        os.remove(temp_image2)
+        for path in output_paths:
+            os.remove(path)
 
-            return {
-                "status": "success",
-                "images": output_images
-            }
+        return {
+            "status": "success",
+            "images": output_images
+        }
 
-        except Exception as e:
-            return {
-                "status": "error",
-                "error": str(e)
-            }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e)
+        }
 
-# Initialize the handler
-predictor = TwoPersonPredictor() 
+if __name__ == "__main__":
+    runpod.serverless.start({"handler": handler}) 

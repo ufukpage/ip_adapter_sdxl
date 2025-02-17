@@ -43,12 +43,12 @@ pipeline = DiffusionPipeline.from_pretrained(
     cache_dir=cache_dir
 )
 # Load IP-Adapter with specific configuration
-pipeline.load_ip_adapter(
-    "h94/IP-Adapter",
-    subfolder="sdxl_models",
-    weight_name="ip-adapter-plus-face_sdxl_vit-h.safetensors",
-    image_encoder_folder="models/image_encoder"  # Add explicit image encoder path
-)
+
+pipeline.load_ip_adapter("h94/IP-Adapter-FaceID",
+                         subfolder=None, 
+                         weight_name="ip-adapter-faceid_sdxl.bin", 
+                         #image_encoder_folder="models/image_encoder"  # Add explicit image encoder path
+                         )
 
 # Set dimensions that match SDXL's ViT encoder expectations
 output_height = 1024
