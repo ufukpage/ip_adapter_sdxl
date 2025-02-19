@@ -80,6 +80,7 @@ class ChannelAttention(nn.Module):
         out = self.sigmoid(avg_out + max_out)
         return x * out
 
+#Helps better align feature channels and importance
 class FPNBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
@@ -157,6 +158,7 @@ class Decoder(nn.Module):
         if self.attention:
             x = self.attention1(x)
         x = x + skip_features[4]  # Skip connection (512x32x32)
+        
         
         # Upsample to 64x64
         x = self.decode2(x)      # 256x64x64

@@ -2,13 +2,15 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms, models
+from torchvision import transforms
 from PIL import Image
 import os
 from tqdm import tqdm
-import numpy as np
-import torch.nn.functional as F
 from beard_removal_models import BeardRemovalVAE
+from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
+import lpips
+import numpy as np
+
 class BeardRemovalDataset(Dataset):
     def __init__(self, data_dir, transform=None):
         self.data_dir = data_dir
@@ -53,21 +55,46 @@ def vae_loss(recon_x, x, mu, logvar, kld_weight=0.0001):
     
     return recon_loss + kld_loss, recon_loss, kld_loss
 
+def calculate_metrics(pred_imgs, target_imgs, masks):
+    psnr = PeakSignalNoiseRatio().to(pred_imgs.device)
+    ssim = StructuralSimilarityIndexMeasure().to(pred_imgs.device)
+    lpips_fn = lpips.LPIPS(net='alex').to(pred_imgs.device)
+
+    # Apply masks to images before calculating metrics
+    masked_pred = pred_imgs * masks
+    masked_target = target_imgs * masks
+    
+    # Calculate metrics on masked images
+    psnr_val = psnr(masked_pred, masked_target)
+    ssim_val = ssim(masked_pred, masked_target)
+    lpips_val = lpips_fn(masked_pred * 2 - 1, masked_target * 2 - 1).mean()
+    
+    return psnr_val.item(), ssim_val.item(), lpips_val.item()
+
 def train(data_dir, num_epochs=100, batch_size=8, learning_rate=0.0002):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    dataset = BeardRemovalDataset(data_dir)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+    # Split dataset into train and validation
+    full_dataset = BeardRemovalDataset(data_dir)
+    train_size = int(0.9 * len(full_dataset))
+    val_size = len(full_dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(full_dataset, [train_size, val_size])
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
     
     model = BeardRemovalVAE().to(device)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate, betas=(0.5, 0.999))
+    
+    best_psnr = 0
+    best_epoch = 0
     
     for epoch in range(num_epochs):
         model.train()
         total_loss = 0
         
-        with tqdm(dataloader, desc=f'Epoch {epoch+1}/{num_epochs}') as pbar:
-            for beard_imgs, clean_imgs in pbar:
+        with tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}') as pbar:
+            for beard_imgs, clean_imgs in pbar:  # Updated to include masks
                 beard_imgs = beard_imgs.to(device)
                 clean_imgs = clean_imgs.to(device)
                 
@@ -86,7 +113,55 @@ def train(data_dir, num_epochs=100, batch_size=8, learning_rate=0.0002):
                     'kld': kld_loss.item()
                 })
         
-        if (epoch + 1) % 100 == 0:
+        # Validation loop (every 10 epochs)
+        if (epoch + 1) % 10 == 0:
+            model.eval()
+            val_psnr_list = []
+            val_ssim_list = []
+            val_lpips_list = []
+            val_loss = 0
+            
+            with torch.no_grad():
+                for beard_imgs, clean_imgs, masks in val_loader:  # Updated to include masks
+                    beard_imgs = beard_imgs.to(device)
+                    clean_imgs = clean_imgs.to(device)
+                    masks = masks.to(device)
+                    
+                    recon_imgs, mu, logvar = model(beard_imgs)
+                    loss, recon_loss, kld_loss = vae_loss(recon_imgs, clean_imgs, mu, logvar, masks)
+                    
+                    psnr, ssim, lpips_val = calculate_metrics(recon_imgs, clean_imgs, masks)
+                    val_psnr_list.append(psnr)
+                    val_ssim_list.append(ssim)
+                    val_lpips_list.append(lpips_val)
+                    val_loss += loss.item()
+            
+            avg_val_psnr = np.mean(val_psnr_list)
+            avg_val_ssim = np.mean(val_ssim_list)
+            avg_val_lpips = np.mean(val_lpips_list)
+            avg_val_loss = val_loss / len(val_loader)
+            
+            print(f'\nValidation Metrics:')
+            print(f'Loss: {avg_val_loss:.4f}')
+            print(f'PSNR: {avg_val_psnr:.2f}')
+            print(f'SSIM: {avg_val_ssim:.4f}')
+            print(f'LPIPS: {avg_val_lpips:.4f}')
+            
+            # Save best model based on PSNR
+            if avg_val_psnr > best_psnr:
+                best_psnr = avg_val_psnr
+                best_epoch = epoch
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'loss': avg_val_loss,
+                    'psnr': avg_val_psnr,
+                    'ssim': avg_val_ssim,
+                    'lpips': avg_val_lpips
+                }, 'best_model.pth')
+        
+        if (epoch + 1) % 50 == 0:
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
@@ -94,7 +169,9 @@ def train(data_dir, num_epochs=100, batch_size=8, learning_rate=0.0002):
                 'loss': total_loss,
             }, f'checkpoint_epoch_{epoch+1}.pth')
             
-        print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {total_loss/len(dataloader):.4f}')
+        print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {total_loss/len(train_loader):.4f}')
+    
+    print(f'\nBest model was saved at epoch {best_epoch+1} with PSNR: {best_psnr:.2f}')
 
 def test_model(model_path, test_image_path, output_path):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -120,7 +197,7 @@ def test_model(model_path, test_image_path, output_path):
     output_image.save(output_path)
 
 if __name__ == "__main__":
-    train("face_pairs", num_epochs=300, batch_size=8)
+    train("face_pairs2", num_epochs=300, batch_size=8)
     
     test_model(
         model_path="checkpoint_epoch_300.pth",

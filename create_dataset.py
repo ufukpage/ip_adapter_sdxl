@@ -2,17 +2,14 @@ import torch
 from diffusers import StableDiffusionPipeline, StableDiffusionInpaintPipeline
 from PIL import Image
 import os
-from tqdm import tqdm
 from ibug.face_detection import RetinaFacePredictor
 from ibug.face_parsing import FaceParser as RTNetPredictor
 import numpy as np
-import cv2
 
-# https://huggingface.co/friedrichor/stable-diffusion-2-1-realistic
 #https://huggingface.co/collections/SG161222/realistic-vision-sd15-656daddd8a37acfa3f30cf53
 #https://github.com/hhj1897/face_parsing
 class FacePairGenerator:
-    def __init__(self, model_id="runwayml/stable-diffusion-v1-5", device="cuda"):
+    def __init__(self, model_id="runwayml/stable-diffusion-v1-5", device="cuda", low_vram=False):
         self.device = device
         self.cache_dir = "./model-cache"
         self.text2img = StableDiffusionPipeline.from_pretrained(
@@ -33,12 +30,10 @@ class FacePairGenerator:
         self.face_parser = RTNetPredictor(
             device=device, ckpt=None, encoder='rtnet50', decoder='fcn', num_classes=14)
 
-   
-        # Enable attention slicing for lower memory usage
-        self.text2img.enable_attention_slicing()
-        self.inpaint.enable_attention_slicing()
+        if low_vram:
+            self.text2img.enable_attention_slicing()
+            self.inpaint.enable_attention_slicing()
 
-        # Make resolutions 1-dimensional
         self.resolutions = [512, 768]
 
     def generate_base_face(self, seed=None):
@@ -62,8 +57,8 @@ class FacePairGenerator:
         selected_age = np.random.choice(age_variations)
         selected_ethnicity = np.random.choice(ethnicity_variations)
             
-        prompt = f"RAW photo, a close up portrait photo of {selected_ethnicity} {selected_age} man, (completely clean shaven face:1.5), (smooth skin:1.3), (no facial hair:1.4), (high detailed skin:1.2), 8k uhd, dslr, soft lighting, high quality, film grain, Fujifilm XT3"
-        negative_prompt = "(beard:1.5), (stubble:1.4), (facial hair:1.5), (mustache:1.4), deformed iris, deformed pupils, monochrome, black & white, semi-realistic, cgi, 3d, render, sketch, cartoon, drawing, anime:1.4, text, close up, cropped, out of frame, worst quality, low quality, jpeg artifacts, ugly, duplicate, morbid, mutilated, extra fingers, mutated hands, poorly drawn hands, poorly drawn face, mutation, deformed, blurry, dehydrated, bad anatomy, bad proportions, extra limbs, cloned face, disfigured, gross proportions, malformed limbs, missing arms, missing legs, extra arms, extra legs, fused fingers, too many fingers, long neck"
+        prompt = f"RAW photo, a close up headshot portrait photo of {selected_ethnicity} {selected_age} man (without beard:2), (clean shaved face:1.2), (high detailed skin:1.2), 8k uhd, dslr, soft lighting, high quality, film grain, Fujifilm XT3"
+        negative_prompt = "(beard, facial hair, deformed iris, deformed pupils, semi-realistic, cgi, 3d, render, sketch, cartoon, drawing, anime:1.4), text, close up, cropped, out of frame, worst quality, low quality, jpeg artifacts, ugly, duplicate, morbid, mutilated, extra fingers, mutated hands, poorly drawn hands, poorly drawn face, mutation, deformed, blurry, dehydrated, bad anatomy, bad proportions, extra limbs, cloned face, disfigured, gross proportions, malformed limbs, missing arms, missing legs, extra arms, extra legs, fused fingers, too many fingers, long neck"
         
         image = self.text2img(
             prompt=prompt,
@@ -78,21 +73,14 @@ class FacePairGenerator:
         return image
     
     def get_beard_mask(self, base_image):
-        # Detect faces
-                # Detect faces
         faces = self.face_detector(np.array(base_image), rgb=False)
         if len(faces) == 0:
             print("No face detected")
             return base_image
 
-        # Get face parsing masks
         
         masks = self.face_parser.predict_img(np.array(base_image), faces, rgb=False)
-        full_mask = np.zeros_like(np.array(base_image))
-        for mask in masks:
-            full_mask += mask
-
-        # Create beard mask using skin and nose information
+        
         skin_mask = (masks == 1).astype(np.uint8)  # Index 1 for skin
         nose_mask = (masks == 6).astype(np.uint8)  # Index 6 for nose
         
@@ -106,30 +94,28 @@ class FacePairGenerator:
         beard_mask = np.zeros_like(skin_mask)
         beard_mask[:, nose_bottom:, :] = skin_mask[:, nose_bottom:, :]
         
-        # Ensure mask is 2D and has correct dimensions
         if len(beard_mask.shape) == 3:
             beard_mask = beard_mask.squeeze()  
         
-        if len(full_mask.shape) == 3:
-            full_mask = full_mask.squeeze()  
-        return beard_mask, full_mask
+        final_mask = (masks > 0).astype(np.uint8)
+        if len(final_mask.shape) == 3:
+            final_mask = final_mask.squeeze()  
+        return beard_mask, final_mask
 
     def add_beard(self, base_image, seed=None):
         if seed is not None:
             torch.manual_seed(seed)
             
-        # Improved prompt for more natural beard generation
         prompt = "RAW photo, a close up portrait photo of man with a well-groomed full beard, (natural dense beard:1.3), (realistic beard texture:1.2), (high detailed skin:1.2), 8k uhd, dslr, soft lighting, high quality, film grain, Fujifilm XT3"
         negative_prompt = "(patchy beard:1.4), (sparse facial hair:1.3), deformed iris, deformed pupils, semi-realistic, cgi, 3d, render, sketch, cartoon, drawing, anime:1.4, text, close up, cropped, out of frame, worst quality, low quality, jpeg artifacts, ugly, duplicate, morbid, mutilated, extra fingers, mutated hands, poorly drawn hands, poorly drawn face, mutation, deformed, blurry, dehydrated, bad anatomy, bad proportions, extra limbs, cloned face, disfigured, gross proportions, malformed limbs"
         
         try:
             beard_mask, full_mask = self.get_beard_mask(base_image)
         except Exception as e:
-            raise Exception("No face detected")
+            raise Exception(e)
         
         mask_image = Image.fromarray(beard_mask * 255)
         full_mask_image = Image.fromarray(full_mask * 255)
-        # Get dimensions from input image
         width, height = base_image.size
         
         bearded_image = self.inpaint(
@@ -159,7 +145,7 @@ class FacePairGenerator:
         try:
             bearded_image, mask_image, full_mask_image = self.add_beard(base_image, seed)
         except Exception as e:
-            raise Exception("No face detected")
+            raise Exception(e)
         beard_path = os.path.join(output_dir, f"beard_{index}.png")
         bearded_image.save(beard_path)
         mask_path = os.path.join(output_dir, f"mask_{index}.png")
@@ -171,7 +157,6 @@ class FacePairGenerator:
 def generate_dataset(num_pairs=100, output_dir="face_pairs", seed_range=1000000000):
     generator = FacePairGenerator(model_id="SG161222/Realistic_Vision_V2.0")
     
-    # Generate random seeds within a larger range
     seeds = np.random.randint(0, seed_range, size=num_pairs)
     
     i = 0
@@ -182,13 +167,14 @@ def generate_dataset(num_pairs=100, output_dir="face_pairs", seed_range=10000000
         except Exception as e:
             print(e)
 
-# Preview function to display some results
 def preview_pairs(output_dir, num_preview=10):
     import matplotlib.pyplot as plt
     
     fig, axes = plt.subplots(num_preview, 2, figsize=(10, 5*num_preview))
-    
-    for i in range(num_preview):
+    # Randomize indices for preview
+    available_indices = [i for i in range(len(os.listdir(output_dir))//4)]  # //4 since we have clean, beard, mask and full_mask
+    preview_indices = np.random.choice(available_indices, size=min(num_preview, len(available_indices)), replace=False)
+    for i in preview_indices:
         clean_img = Image.open(os.path.join(output_dir, f"clean_{i}.png"))
         beard_img = Image.open(os.path.join(output_dir, f"beard_{i}.png"))
         
@@ -203,7 +189,8 @@ def preview_pairs(output_dir, num_preview=10):
     plt.tight_layout()
     plt.show()
 
-# Generate the dataset
 if __name__ == "__main__":
-    generate_dataset(output_dir="face_pairs_test", num_pairs=10)
-    preview_pairs("face_pairs_test", num_preview=10)
+    #print("Waiting for 1 hour before starting dataset generation...")
+    #time.sleep(3600)  # Sleep for 3600 seconds (1 hour)
+    generate_dataset(output_dir="face_pairs2", num_pairs=10000)
+    preview_pairs("face_pairs", num_preview=10)
